@@ -332,8 +332,31 @@ int main(void) {
     //Content of {Message} is not specified and can be in any form.
     //Send message "{Message}#{Signature}" to the topic "api/dm/{PARTNER_ID}" with 'publishMessage'.
 
-    while (true)
-        sleep(1000);
+    /* Log drone coordinates during mission execution */
+    logEntry("Starting coordinate logging", ENTITY_NAME, LogLevel::LOG_INFO);
+    
+    while (true) {
+        int32_t latitude = 0, longitude = 0, altitude = 0;
+        
+        // Get current drone coordinates
+        if (getCoords(latitude, longitude, altitude)) {
+            // Convert coordinates from degrees*10^7 to decimal degrees
+            // and from cm to meters for altitude
+            double lat_deg = latitude / 10000000.0;
+            double lon_deg = longitude / 10000000.0;
+            double alt_m = altitude / 100.0;
+            
+            // Format and log coordinates
+            snprintf(logBuffer, 256, "Drone Position - Latitude: %.7f, Longitude: %.7f, Altitude: %.2f m",
+                    lat_deg, lon_deg, alt_m);
+            logEntry(logBuffer, ENTITY_NAME, LogLevel::LOG_INFO);
+        } else {
+            logEntry("Failed to retrieve drone coordinates", ENTITY_NAME, LogLevel::LOG_WARNING);
+        }
+        
+        // Sleep for 1 second to limit logging frequency
+        sleep(1);
+    }
 
     return EXIT_SUCCESS;
 }
