@@ -1,0 +1,5 @@
+entity drone_controller.AutopilotConnector
+
+endpoints {
+    interface : drone_controller.AutopilotConnectorInterface
+}

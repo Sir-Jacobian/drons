@@ -1,0 +1,14 @@
+
+services:
+#################################################
+  mavproxy:
+    image: simulator
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    container_name: mavproxy-demo-e2e
+    command: expect /home/user/tests/e2e-offline-real.exp
+    working_dir: /home/user/mavproxy
+    user: user
+    restart: "no"
+#################################################

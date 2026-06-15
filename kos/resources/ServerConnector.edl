@@ -1,0 +1,5 @@
+entity drone_controller.ServerConnector
+
+endpoints {
+    interface : drone_controller.ServerConnectorInterface
+}

@@ -1,0 +1,10 @@
+package drone_controller.PeripheryControllerInterface
+
+const UInt32 MaxPictureSize = 4194304;
+
+interface {
+    EnableBuzzer(out UInt8 success);
+    SetKillSwitch(in UInt8 enable, out UInt8 success);
+    SetCargoLock(in UInt8 enable, out UInt8 success);
+    TakePicture(out string<MaxPictureSize> picture, out UInt8 success);
+}

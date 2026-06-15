@@ -1,0 +1,5 @@
+entity drone_controller.NavigationSystem
+
+endpoints {
+    interface : drone_controller.NavigationSystemInterface
+}

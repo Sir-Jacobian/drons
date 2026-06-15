@@ -1,0 +1,436 @@
+import datetime
+import json
+import os
+import time
+import random
+from context import context
+from extensions import task_scheduler_client as scheduler
+from constants import (
+    ARMED, DISARMED, NOT_FOUND, OK, LOGS_PATH,
+    FORBIDDEN_ZONES_PATH, FORBIDDEN_ZONES_DELTA_PATH,
+)
+from db.dao import (
+    add_and_commit, add_changes, commit_changes, delete_entity, get_entity_by_key,
+    get_entities_by_field, get_entities_by_field_with_order, save_public_key,
+    get_key, flush, save_event
+)
+from db.models import UavTelemetry, MissionStep, Mission, UavPublicKeys, Uav
+from utils import (
+    cast_wrapper, generate_forbidden_zones_string,
+    get_sha256_hex, haversine, compute_and_save_forbidden_zones_delta
+)
+from .mqtt_handlers import mqtt_publish_flight_state, mqtt_publish_ping, mqtt_publish_forbidden_zones, mqtt_publish_auth
+    
+def key_kos_exchange_handler(id: str, n: str, e: str):
+    """
+    Обрабатывает обмен ключами с KOS.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+        n (str): Модуль открытого ключа.
+        e (str): Экспонента открытого ключа.
+
+    Returns:
+        str: Строка с открытым ключом ORVD.
+    """
+    n, e = str(int(n, 16)), str(int(e, 16))
+    key_entity = get_entity_by_key(UavPublicKeys, id)
+    if key_entity is None:
+        save_public_key(n, e, f'kos{id}')
+    else:
+        key_entity.n = n
+        key_entity.e = e
+        commit_changes()
+        flush()
+    orvd_n, orvd_e = get_key('orvd', private=False)
+    str_to_send = f'$Key: {hex(orvd_n)[2:]} {hex(orvd_e)[2:]}'
+    return str_to_send
+
+def kos_key_handler(target_id: str):
+    """
+    Возвращает открытый ключ KOS для заданного id.
+
+    Args:
+        target_id (str): Идентификатор БПЛА.
+
+    Returns:
+        str: Строка с открытым ключом KOS или $Key: NOT_FOUND.
+    """
+    key_entity = get_entity_by_key(UavPublicKeys, target_id)
+    if key_entity is None:
+        return '$Key: NOT_FOUND'
+    
+    n_hex = hex(int(key_entity.n))[2:]
+    e_hex = hex(int(key_entity.e))[2:]
+    return f'$Key: {n_hex} {e_hex}'
+
+def auth_handler(id: str):
+    """
+    Обрабатывает аутентификацию БПЛА.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+
+    Returns:
+        str: Строка подтверждения аутентификации.
+    """
+    uav_entity = get_entity_by_key(Uav, id)
+    if not uav_entity:
+        uav_entity = Uav(id=id, is_armed=False, state='В сети', kill_switch_state=False)
+        add_and_commit(uav_entity)
+    else:
+        uav_entity.is_armed = False
+        uav_entity.state = 'В сети'
+        uav_entity.kill_switch_state = False
+        add_changes(uav_entity)
+
+    mission_entity = get_entity_by_key(Mission, id)
+    if mission_entity:
+        mission_entity.is_accepted = False
+        add_changes(mission_entity)
+
+    if id in context.permission_revoked_uavs:
+        context.permission_revoked_uavs.remove(id)
+    if id in context.connection_broken_uavs:
+        context.connection_broken_uavs.remove(id)
+    
+    commit_changes()
+    flush()
+    mqtt_publish_flight_state(id)
+    scheduler.add_interval_task(
+        task_name=f"ping_{id}",
+        seconds=uav_entity.delay,
+        func=mqtt_publish_ping,
+        args=(id,)
+    )
+    mqtt_publish_forbidden_zones()
+    mqtt_publish_auth(id)
+    
+    context.uav_tag_map[id] = random.choice(['A1', 'A2', 'A3'])
+
+    return f'$Auth id={id}'
+
+def arm_handler(id: str, **kwargs):
+    """
+    Обрабатывает запрос на арм БПЛА.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+
+    Returns:
+        str: Статус арма БПЛА.
+    """
+    uav_entity = get_entity_by_key(Uav, id)
+    if not uav_entity:
+        return NOT_FOUND
+    elif uav_entity.is_armed:
+        return f'$Arm {ARMED}$Delay {uav_entity.delay}'
+    else:
+        mission = get_entity_by_key(Mission, id)
+        if mission and mission.is_accepted:
+            context.arm_queue.add(id)
+            uav_entity.state = 'Ожидает'
+            commit_changes()
+            flush()
+            mqtt_publish_flight_state(id)
+            return OK
+        else:
+            return f'$Arm {DISARMED}$Delay {uav_entity.delay}'
+
+
+def flight_info_handler(id: str) -> str:
+    """
+    Обрабатывает запрос на проверку информации полета БПЛА.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+
+    Returns:
+        str: Состояние полета БПЛА.
+    """
+    if not context.flight_info_response:
+        return '$Flight -1'
+    uav_entity = get_entity_by_key(Uav, id)
+    if not uav_entity:
+        return NOT_FOUND
+    else:
+        forbidden_zones_hash = get_forbidden_zones_hash_handler(id=id)
+        delay = f'$Delay {uav_entity.delay}'
+        if uav_entity.kill_switch_state:
+            status = '$Flight -1'
+        elif uav_entity.is_armed:
+            status = '$Flight 0'
+        else:
+            status = '$Flight 1'
+        return ''.join([status, forbidden_zones_hash, delay])
+
+
+def _restore_permission(uav_id):
+    uav_entity = get_entity_by_key(Uav, uav_id)
+    if uav_entity:
+        uav_entity.is_armed = True
+        uav_entity.state = 'В полете'
+        commit_changes()
+        flush()
+        mqtt_publish_flight_state(uav_id)
+
+def _restore_connection(uav_id):
+    context.flight_info_response = True
+
+def change_forbidden_zones(lat: float, lon: float):
+    target_zones_path = None
+    if context.change_forbidden_zones_A and haversine(lat, lon, context.change_forbidden_zones_A['lat'], context.change_forbidden_zones_A['lon']) <= 1:
+        target_zones_path = 'static/resources/zones_A.json'
+    elif context.change_forbidden_zones_B and haversine(lat, lon, context.change_forbidden_zones_B['lat'], context.change_forbidden_zones_B['lon']) <= 1:
+        target_zones_path = 'static/resources/zones_B.json'
+    elif context.change_forbidden_zones_C and haversine(lat, lon, context.change_forbidden_zones_C['lat'], context.change_forbidden_zones_C['lon']) <= 1:
+        target_zones_path = 'static/resources/zones_C.json'
+
+    if target_zones_path:
+        with open(target_zones_path, 'r', encoding='utf-8') as f:
+            new_zones_data = json.load(f)
+        
+        with open(FORBIDDEN_ZONES_PATH, 'r', encoding='utf-8') as f:
+            current_zones_data = json.load(f)
+
+        if json.dumps(new_zones_data, sort_keys=True) != json.dumps(current_zones_data, sort_keys=True):
+            with open(FORBIDDEN_ZONES_PATH, 'w', encoding='utf-8') as f:
+                json.dump(new_zones_data, f, ensure_ascii=False, indent=4)
+            
+            compute_and_save_forbidden_zones_delta(current_zones_data, new_zones_data)
+            mqtt_publish_forbidden_zones()
+
+def telemetry_handler(id: str, lat: float, lon: float, alt: float,
+                      azimuth: float, dop: float, sats: float, speed: float = 0, **kwargs):
+    """
+    Обрабатывает телеметрию БПЛА.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+        lat (float): Широта.
+        lon (float): Долгота.
+        alt (float): Высота.
+        azimuth (float): Азимут.
+        dop (float): Снижение точности.
+        sats (float): Количество спутников.
+        speed (float): Скорость.
+
+    Returns:
+        str: Статус арма БПЛА.
+    """
+    uav_entity = get_entity_by_key(Uav, id)
+    if not uav_entity and context.display_only:
+        uav_entity = Uav(id=id, is_armed=False, state='В сети', kill_switch_state=False)
+        add_and_commit(uav_entity)
+        
+    if not uav_entity:
+        return NOT_FOUND
+    else:
+        lat = cast_wrapper(lat, float)
+        if lat:
+            lat /= 1e7
+        lon = cast_wrapper(lon, float)
+        if lon:
+            lon /= 1e7
+        alt = cast_wrapper(alt, float)
+        if alt:
+            alt /= 1e2
+        azimuth = cast_wrapper(azimuth, float)
+        if azimuth:
+            azimuth /= 1e7
+        dop = cast_wrapper(dop, float)
+        sats = cast_wrapper(sats, int)
+        speed = cast_wrapper(speed, float)
+        record_time = datetime.datetime.now(datetime.timezone.utc)
+        uav_telemetry_entity = get_entity_by_key(UavTelemetry, (uav_entity.id, record_time))
+        if not uav_telemetry_entity:
+            uav_telemetry_entity = UavTelemetry(uav_id=uav_entity.id, lat=lat, lon=lon, alt=alt,
+                                                azimuth=azimuth, dop=dop, sats=sats, speed=speed, record_time=record_time)
+            add_and_commit(uav_telemetry_entity)
+        else:
+            uav_telemetry_entity.lat = lat
+            uav_telemetry_entity.lon = lon
+            uav_telemetry_entity.alt = alt
+            uav_telemetry_entity.azimuth = azimuth
+            uav_telemetry_entity.dop = dop
+            uav_telemetry_entity.sats = sats
+            uav_telemetry_entity.speed = speed
+            commit_changes()
+
+        if context.permission_revoke_enabled and context.permission_revoke_coords and id not in context.permission_revoked_uavs:
+            distance = haversine(lat, lon, context.permission_revoke_coords['lat'], context.permission_revoke_coords['lon'])
+            if distance <= 1:
+                uav_entity.is_armed = False
+                uav_entity.state = 'В сети'
+                commit_changes()
+                flush()
+                mqtt_publish_flight_state(id)
+                context.permission_revoked_uavs.add(id)
+                scheduler.add_oneshot_task(f"restore_permission_{id}", 30, _restore_permission, args=(id,))
+
+        if context.connection_break_enabled and context.connection_break_coords and id not in context.connection_broken_uavs:
+            distance = haversine(lat, lon, context.connection_break_coords['lat'], context.connection_break_coords['lon'])
+            if distance <= 1:
+                context.flight_info_response = False
+                context.connection_broken_uavs.add(id)
+                scheduler.add_oneshot_task(f"restore_connection_{id}", 30, _restore_connection, args=(id,))
+        
+        if context.change_forbidden_zones_enabled:
+            change_forbidden_zones(lat, lon)
+
+        if not uav_entity.is_armed:
+            return f'$Arm: {DISARMED}'
+        else:
+            return f'$Arm: {ARMED}'
+    
+
+def fmission_kos_handler(id: str):
+    """
+    Обрабатывает запрос на получение полетного задания для KOS.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+
+    Returns:
+        str: Строка с полетным заданием или NOT_FOUND.
+    """
+    uav_entity = get_entity_by_key(Uav, id)
+    if uav_entity:
+        mission = get_entity_by_key(Mission, id)
+        if mission and mission.is_accepted:
+            mission_steps = get_entities_by_field_with_order(MissionStep, MissionStep.mission_id, id, order_by_field=MissionStep.step)
+            if mission_steps and mission_steps.count() != 0:
+                mission_steps = list(map(lambda e: e.operation, mission_steps))
+                return f'$FlightMission {"&".join(mission_steps)}'
+    return NOT_FOUND
+
+            
+def get_all_forbidden_zones_handler(*args, **kwargs):
+    """
+    Обрабатывает запрос на получение всех запрещенных для полета зон.
+
+    Returns:
+        str: Строка с информацией о запрещенных зонах или NOT_FOUND.
+    """
+    try:
+        with open(FORBIDDEN_ZONES_PATH, 'r', encoding='utf-8') as f:
+            forbidden_zones = json.load(f)
+            result_str = generate_forbidden_zones_string(forbidden_zones)
+            return result_str
+
+    except Exception as e:
+        print(e)
+        return NOT_FOUND
+
+
+def get_forbidden_zones_delta_handler(*args, **kwargs):
+    """
+    Обрабатывает запрос на получение дельты изменений в запрещенных для полета зонах.
+
+    Returns:
+        str: Строка с дельтой изменений в запрещенных зонах или NOT_FOUND.
+    """
+    try:
+        with open(FORBIDDEN_ZONES_DELTA_PATH, 'r', encoding='utf-8') as f:
+            delta_zones = json.load(f)
+        
+        delta_str = f'$ForbiddenZonesDelta {len(delta_zones["features"])}'
+        for zone in delta_zones['features']:
+            name = zone['properties']['name']
+            change_type = zone['properties']['change_type']
+            coordinates = zone['geometry']['coordinates'][0]
+            delta_str += f'&{name}&{change_type}&{len(coordinates)}&{"&".join(list(map(lambda e: f"{e[1]:.7f}_{e[0]:.7f}", coordinates)))}'
+        
+        return delta_str
+    except Exception as e:
+        print(e)
+        return NOT_FOUND
+    
+
+def get_forbidden_zones_hash_handler(*args, **kwargs):
+    """
+    Обрабатывает запрос на получение SHA-256 хэша строки запрещенных зон.
+
+    Returns:
+        str: SHA-256 хэш строки запрещенных зон или NOT_FOUND.
+    """
+    try:
+        with open(FORBIDDEN_ZONES_PATH, 'r', encoding='utf-8') as f:
+            forbidden_zones = json.load(f)
+            result_str = generate_forbidden_zones_string(forbidden_zones)
+            hash_value = get_sha256_hex(result_str)
+            return f'$ForbiddenZonesHash {hash_value}'
+
+    except Exception as e:
+        print(e)
+        return NOT_FOUND
+
+
+def revise_mission_handler(id: str, mission: str, **kwargs):
+    mission_list = mission.split('*')
+    
+    mission_entity = get_entity_by_key(Mission, id)
+    if mission_entity:
+        get_entities_by_field(MissionStep, MissionStep.mission_id, id).delete()
+        delete_entity(mission_entity)
+        commit_changes()
+    
+    mission_entity = Mission(uav_id=id, is_accepted=context.auto_mission_approval)
+    add_changes(mission_entity)
+    for idx, cmd in enumerate(mission_list):
+        mission_step_entity = MissionStep(mission_id=id, step=idx, operation=cmd)
+        add_changes(mission_step_entity)
+    commit_changes()
+    
+    if context.auto_mission_approval:
+        return '$Approve 0'
+
+    uav_entity = get_entity_by_key(Uav, id)
+    if uav_entity:
+        uav_entity.is_armed = False
+        uav_entity.state = 'Ожидает'
+        commit_changes()
+        flush()
+        mqtt_publish_flight_state(id)
+        
+    context.revise_mission_queue.add(id)
+    return OK
+
+
+def save_logs_handler(id: str, log: str, **kwargs):
+    """
+    Обрабатывает запрос на сохранение логов БПЛА.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+        log (str): Строка с логами для сохранения.
+
+    Returns:
+        str: OK в случае успешного сохранения.
+    """
+    try:
+        if not os.path.exists(LOGS_PATH):
+            os.makedirs(LOGS_PATH)
+        with open(f'{LOGS_PATH}/{id}.txt', 'a') as f:
+            f.write(f'\n{log}')
+    except Exception as e:
+        print(e)
+    return OK
+
+def save_events_handler(id: str, log_message: str, **kwargs):
+    """
+    Обрабатывает запрос на сохранение событий БПЛА в БД и логах.
+
+    Args:
+        id (str): Идентификатор БПЛА.
+        log_string (str): Строка с логом для сохранения.
+
+    Returns:
+        str: OK в случае успешного сохранения.
+    """
+    try:
+        save_event(uav_id=id, log_message=log_message)
+        save_logs_handler(id=id, log=log_message)
+    except Exception as e:
+        print(e)
+    return OK

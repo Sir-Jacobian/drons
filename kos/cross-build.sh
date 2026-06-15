@@ -1,0 +1,278 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(dirname "$(realpath "${0}")")"
+
+export LANG=C
+export TARGET="aarch64-kos"
+export PKG_CONFIG=""
+export SDK_VERSION="1.4.0.102"
+export SDK_TYPE=""
+
+export BUILD_WITH_CLANG=
+export BUILD_WITH_GCC=
+
+SIMULATION=""
+SERVER=""
+KOS_TARGET=""
+BOARD_ID=""
+PARTNER_ID=""
+UNIT_TESTS=""
+PAL_TESTS=""
+INSPECTOR_ROLE=""
+SIMULATOR_IP="10.0.2.2"
+SERVER_IP="10.0.2.2"
+MQTT_IP="10.0.2.2"
+MQTT_USERNAME=""
+MQTT_PASSWORD=""
+NTP_IP=${SERVER_IP}
+COORD_SRC=2
+ALT_SRC=2
+SD_IMAGE="FALSE"
+
+set -eu
+
+function help
+{
+    cat <<EOF
+
+  Usage: $0 [--help] [-s <SDK path>]
+
+  Compile and link precompiled_vfs project with respect to specified arguments.
+
+  Optional arguments:
+    -v, --sdk-version,
+             Version of KasperskyOS Community Edition SDK
+             Default: 1.4.0.102
+    --board-id,
+             User-defined board ID to use instead of MAC-address
+    --partner-id,
+             Board ID of the partner (deliverer's for inspector and inspector's for deliverer)
+             Use "NULL" if single drone is used
+    --simulator-ip,
+             User-defined IP of SITL
+    --server-ip,
+             User-defined IP of the ATM server
+    --mqtt-ip,
+             User-defined IP of MQTT server
+    --mqtt-username,
+             Username for MQTT server
+    --mqtt-password,
+             Password for MQTT server
+    --ntp-ip,
+             User-defined IP of NTP server
+    --target,
+             Build target: hardware (real),
+                           hardware-with-image (real-with-image),
+                           simulation (sim),
+                           unit-tests (unit),
+                           pal-tests (pal).
+    --mode,
+             Connection mode: online or offline
+    --coords,
+             Source of horizontal coordinates: gnss or lns
+    --alt,
+             Source of altitude: baro or lns
+    --role,
+             Role of drone: deliverer or inspector
+
+  Examples:
+      bash cross-build.sh -s /opt/KasperskyOS-Community-Edition-RaspberryPi4b-wifi
+
+EOF
+}
+
+# Main
+while [[ $# > 0 ]];
+do
+    key="$1"
+    case $key in
+        --help|-h)
+            help
+            exit 0
+            ;;
+        --sdk-version|-v)
+            SDK_VERSION=$2
+            ;;
+        --simulator-ip)
+            SIMULATOR_IP=$2
+            ;;
+        --server-ip)
+            SERVER_IP=$2
+            ;;
+        --mqtt-ip)
+            MQTT_IP=$2
+            ;;
+        --mqtt-username)
+            MQTT_USERNAME=$2
+            ;;
+        --mqtt-password)
+            MQTT_PASSWORD=$2
+            ;;
+        --ntp-ip)
+            NTP_IP=$2
+            ;;
+        --board-id)
+            BOARD_ID=$2
+            ;;
+        --partner-id)
+            PARTNER_ID=$2
+            ;;
+        --target)
+            if [ "$2" == "hardware" ] || [ "$2" == "real" ]; then
+                SIMULATION="FALSE"
+                UNIT_TESTS="FALSE"
+                PAL_TESTS="FALSE"
+                KOS_TARGET="kos-image"
+                SDK_TYPE="RaspberryPi4b"
+            elif [ "$2" == "hardware-with-image" ] || [ "$2" == "real-with-image" ]; then
+                SIMULATION="FALSE"
+                UNIT_TESTS="FALSE"
+                PAL_TESTS="FALSE"
+                KOS_TARGET="kos-image"
+                SDK_TYPE="RaspberryPi4b"
+                SD_IMAGE="TRUE"
+            elif [ "$2" == "simulation" ] || [ "$2" == "sim" ]; then
+                SIMULATION="TRUE"
+                UNIT_TESTS="FALSE"
+                PAL_TESTS="FALSE"
+                KOS_TARGET="sim"
+                SDK_TYPE="Qemu"
+            elif [ "$2" == "unit-tests" ] || [ "$2" == "unit" ]; then
+                SIMULATION="TRUE"
+                UNIT_TESTS="TRUE"
+                PAL_TESTS="FALSE"
+                KOS_TARGET="sim"
+                SDK_TYPE="Qemu"
+                BUILD="${SCRIPT_DIR}/build"
+            elif [ "$2" == "pal-tests" ] || [ "$2" == "pal" ]; then
+                SIMULATION="TRUE"
+                UNIT_TESTS="FALSE"
+                PAL_TESTS="TRUE"
+                KOS_TARGET="pal-test0"
+                SDK_TYPE="Qemu"
+                BUILD="${SCRIPT_DIR}/build"
+            else
+                echo "Unknown target '$2'"
+                exit 1
+            fi
+            ;;
+        --mode)
+            if [ "$2" == "online" ]; then
+                SERVER="TRUE"
+            elif [ "$2" == "offline" ]; then
+                SERVER="FALSE"
+            else
+                echo "Unknown mode '$2'"
+                exit 1
+            fi
+            ;;
+        --coords)
+            if [ "$2" == "gnss" ] || [ "$2" == "GNSS" ]; then
+                COORD_SRC=1
+            elif [ "$2" == "lns" ] || [ "$2" == "LNS" ]; then
+                COORD_SRC=2
+            else
+                echo "Unknown coordinates source '$2'"
+                exit 1
+            fi
+            ;;
+        --alt)
+            if [ "$2" == "baro" ] || [ "$2" == "barometer" ]; then
+                ALT_SRC=1
+            elif [ "$2" == "lns" ] || [ "$2" == "LNS" ]; then
+                ALT_SRC=2
+            else
+                echo "Unknown altitude source '$2'"
+                exit 1
+            fi
+            ;;
+        --role)
+            if [ "$2" == "inspector" ]; then
+                INSPECTOR_ROLE="TRUE"
+                BUILD="${SCRIPT_DIR}/build_inspector"
+            elif [ "$2" == "deliverer" ]; then
+                INSPECTOR_ROLE="FALSE"
+                BUILD="${SCRIPT_DIR}/build_deliverer"
+            else
+                echo "Unknown drone role '$2'"
+                exit 1
+            fi
+            ;;
+        -*)
+            echo "Invalid option: $key"
+            exit 1
+            ;;
+        esac
+    shift
+done
+
+if [ "$SIMULATION" == "" ]; then
+    echo "Build target is not set"
+    exit 1
+fi
+
+if [ "$SERVER" == "" ] && [ "$UNIT_TESTS" != "TRUE" ] && [ "$PAL_TESTS" != "TRUE" ]; then
+    echo "Build mode is not set"
+    exit 1
+fi
+
+if [ "$INSPECTOR_ROLE" == "" ] && [ "$UNIT_TESTS" == "FALSE" ] && [ "$PAL_TESTS" == "FALSE" ]; then
+    echo "Drone role is not set"
+    exit 1
+fi
+
+if [ "$SDK_TYPE" == "" ] || [ "$SDK_VERSION" == "" ]; then
+    echo "KasperskyOS SDK path is not correct"
+    exit 1
+fi
+
+if [ "$COORD_SRC" == 1 ] && [ "$ALT_SRC" == 2 ]; then
+    echo "Could not use GNSS and LNS at the same time"
+    exit 1
+fi
+
+if [ "$SIMULATION" == "TRUE" ]; then
+    if [ "$INSPECTOR_ROLE" == "TRUE" ]; then
+        if [ "$BOARD_ID" == "" ]; then
+            BOARD_ID="inspector"
+        fi
+        if [ "$PARTNER_ID" == "" ]; then
+            PARTNER_ID="deliverer"
+        fi
+    else
+        if [ "$BOARD_ID" == "" ]; then
+            BOARD_ID="deliverer"
+        fi
+        if [ "$PARTNER_ID" == "" ]; then
+            PARTNER_ID="inspector"
+        fi
+    fi
+fi
+
+export SDK_PREFIX="/opt/KasperskyOS-Community-Edition-$SDK_TYPE-$SDK_VERSION"
+export INSTALL_PREFIX="$BUILD/../install"
+
+"$SDK_PREFIX/toolchain/bin/cmake" -G "Unix Makefiles" -B "$BUILD" \
+      -D SIMULATION=$SIMULATION \
+      -D SERVER=$SERVER \
+      -D UNIT_TESTS="$UNIT_TESTS" \
+      -D PAL_TESTS="$PAL_TESTS" \
+      -D BOARD_ID="$BOARD_ID" \
+      -D PARTNER_ID="$PARTNER_ID" \
+      -D SIMULATOR_IP=$SIMULATOR_IP \
+      -D SERVER_IP=$SERVER_IP \
+      -D MQTT_IP=$MQTT_IP \
+      -D MQTT_USERNAME=$MQTT_USERNAME \
+      -D MQTT_PASSWORD=$MQTT_PASSWORD \
+      -D NTP_IP=$NTP_IP \
+      -D COORD_SRC=$COORD_SRC \
+      -D ALT_SRC=$ALT_SRC \
+      -D INSPECTOR_ROLE=$INSPECTOR_ROLE \
+      -D CMAKE_BUILD_TYPE:STRING=Debug \
+      -D CMAKE_INSTALL_PREFIX:STRING="$INSTALL_PREFIX" \
+      -D CMAKE_TOOLCHAIN_FILE="$SDK_PREFIX/toolchain/share/toolchain-aarch64-kos.cmake" \
+      "$SCRIPT_DIR/" && "$SDK_PREFIX/toolchain/bin/cmake" --build "$BUILD" --target "$KOS_TARGET" --verbose
+
+if [ "$SD_IMAGE" == "TRUE" ]; then
+	"$SDK_PREFIX/toolchain/bin/cmake" --build "$BUILD" --target "sd-image" --verbose
+fi

@@ -1,0 +1,5 @@
+entity drone_controller.PeripheryController
+
+endpoints {
+    interface : drone_controller.PeripheryControllerInterface
+}
